@@ -7,6 +7,7 @@ import os
 import boto3
 import argparse
 import time
+import paramiko
 
 REGIONS = {
     "US East": [
@@ -50,13 +51,14 @@ def parse_args():
     # List all options
     list_all_parser = subparsers.add_parser("list-all", help="List all NodeID, CustomerID and IP's.")
     list_all_parser.add_argument("-a", action="store_true", dest="list_all", default=True)
+    list_all_parser.add_argument("--region", action="store", dest="region", help="Server location.(Default us-east-1)", default="us-east-1")
     list_all_parser.set_defaults(opt_name="list_all")
     # Execute options
     execute_parser = subparsers.add_parser("execute", help="Execute script for CustomerID or NodeType.")
     execute_parser.add_argument("--customer-id", action="store", dest="customer_id", help="CustomerID")
     execute_parser.add_argument("--node-type", action="store", dest="node_type", help="NodeType for script that will be execute.")
-    execute_parser.add_argument("-t", action="store", dest="script_transport", help="Transfer script to remote machines (Default path: /tmp)", default="/tmp")
     execute_parser.add_argument("--script", action="store", dest="script_path", help="Path to script that will be execute(if script located your local, please ues -t option)", required=True)
+    execute_parser.add_argument("--region", action="store", dest="region", help="Server location.(Default us-east-1)", default="us-east-1")
     execute_parser.set_defaults(opt_name="execute")
     # Backup options
     backup_parser = subparsers.add_parser("backup", help="Create backup for given NodeID.")
@@ -71,6 +73,17 @@ def parse_args():
     rollback_parser.add_argument("--rollback-id", action="store", dest="rollback_id", help="RollbackID")
     rollback_parser.set_defaults(opt_name="rollback")
     return parser.parse_args()
+
+
+def make_connection(**kwargs):
+    ssh_client = paramiko.SSHClient()
+    ssh_client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    if "with_key_file" in kwargs:
+        key_file = paramiko.RSAKey.from_private_key_file(kwargs["key_file_path"])
+        ssh_client.connect(hostname=kwargs["host"], username=kwargs["user"], pkey=key_file)
+    else:
+        ssh_client.connect(hostname=kwargs["host"], username=kwargs["user"], password=kwargs["pass"])
+    return ssh_client
 
 
 def get_ec2_session(region):
@@ -88,6 +101,22 @@ def import_key_pair(manager, key_path, customer_id):
         sys.exit(1)
     except:
         return
+
+
+def get_instance_details(manager, instance_id):
+    return manager.Instance(instance_id)
+
+
+def get_all_instance_ids():
+    nodes = list()
+    for region in REGIONS.values():
+        for i in range(len(region)):
+            ec2_client, ec2_resource = get_ec2_session(region[i])
+            try:
+                nodes.append(ec2_client.describe_instances()["Reservations"][0]["Instances"][0]["InstanceId"])
+            except:
+                pass
+    return nodes
 
 
 def create_instance(manager, node_type, customer_id):
@@ -132,8 +161,8 @@ def create_instance(manager, node_type, customer_id):
                 "Value": customer_id
             },
             {
-                "Key": "InstanceID",
-                "Value": instance_id
+                "Key": "NodeType",
+                "Value": node_type
             }
         ]
     )
@@ -168,9 +197,37 @@ def create_operation(argv):
     return create_instance(ec2_resource, argv.node_type, argv.customer_id)
 
 
+def list_nodes_operation(argv):
+    return "\n".join(get_all_instance_ids())
+
+
+def list_all_operation(argv):
+    ec2_client, ec2_resource = get_ec2_session(argv.region)
+    prop = list()
+    for i in get_all_instance_ids():
+        ids = get_instance_details(ec2_resource, i)
+        customer_id = None
+        for e in ids.tags:
+            if e["Key"] == "CustomerID":
+                customer_id = e["Value"]
+        prop.append("{0}, {1}, {2}".format(customer_id, i, ids.private_ip_address))
+    return "\n".join(prop)
+
+
+def execute_operation(argv):
+    ec2_client, ec2_resource = get_ec2_session(argv.region)
+    if argv.node_type is not None:
+        filter = [{"Name": "tag:NodeType", "Values": [argv.node_type]}]
+    else:
+        filter = [{"Name": "tag:CustomerID", "Values": [argv.customer_id]}]
+
+
 if __name__ == "__main__":
     opt_list = {
-        "create": create_operation
+        "create": create_operation,
+        "list_nodes": list_nodes_operation,
+        "list_all": list_all_operation,
+        "execute": execute_operation
     }
     args = parse_args()
     print opt_list[args.opt_name](args)
