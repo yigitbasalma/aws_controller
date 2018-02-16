@@ -9,6 +9,8 @@ import argparse
 import time
 import paramiko
 
+from termcolor import colored
+
 REGIONS = {
     "US East": [
         "us-east-1",
@@ -78,7 +80,7 @@ def parse_args():
 def make_connection(**kwargs):
     ssh_client = paramiko.SSHClient()
     ssh_client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    if "with_key_file" in kwargs:
+    if "key_file_path" in kwargs:
         key_file = paramiko.RSAKey.from_private_key_file(kwargs["key_file_path"])
         ssh_client.connect(hostname=kwargs["host"], username=kwargs["user"], pkey=key_file)
     else:
@@ -113,7 +115,8 @@ def get_all_instance_ids():
         for i in range(len(region)):
             ec2_client, ec2_resource = get_ec2_session(region[i])
             try:
-                nodes.append(ec2_client.describe_instances()["Reservations"][0]["Instances"][0]["InstanceId"])
+                for node in ec2_client.describe_instances()["Reservations"][0]["Instances"]:
+                    nodes.append(node["InstanceId"])
             except:
                 pass
     return nodes
@@ -188,6 +191,8 @@ def create_instance(manager, node_type, customer_id):
                 }
             ]
         )
+    if len(backup_disk) > 0:
+        pass
     return instance_id
 
 
@@ -210,16 +215,27 @@ def list_all_operation(argv):
         for e in ids.tags:
             if e["Key"] == "CustomerID":
                 customer_id = e["Value"]
-        prop.append("{0}, {1}, {2}".format(customer_id, i, ids.private_ip_address))
+        prop.append("{0}, {1}, {2}".format(customer_id, i, ids.public_ip_address))
     return "\n".join(prop)
 
 
 def execute_operation(argv):
     ec2_client, ec2_resource = get_ec2_session(argv.region)
+    command = open(argv.script_path, "r").read()
+    results = list()
     if argv.node_type is not None:
         filter = [{"Name": "tag:NodeType", "Values": [argv.node_type]}]
     else:
         filter = [{"Name": "tag:CustomerID", "Values": [argv.customer_id]}]
+    for target in ec2_client.describe_instances(Filters=filter)["Reservations"][0]["Instances"]:
+        with make_connection(host=target["PublicIpAddress"], user="ec2-user", key_file_path=os.getenv("PUB_KEY")) as conn:
+            _, stdout, stderr = conn.exec_command(command)
+            err = stderr.readlines()
+            if len(err) > 0:
+                results.append(colored("Error occurred when running script named %s on %s.\nError is: \n\t%s" %(argv.script_path, target["PublicIpAddress"], "\t".join(err)), "red"))
+                continue
+            results.append(colored("Execution successful for %s.\nOutput is: \n\t%s" %(target["PublicIpAddress"], "\t".join(stdout.readlines())), "green"))
+    return "\n".join(results)
 
 
 if __name__ == "__main__":
