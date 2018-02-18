@@ -26,13 +26,29 @@ NODE_PROP = {
     "Manager": {
         "type": "t2.nano",
         "imageID": "ami-97785bed",
-        "disk": 20,
-        "backup_disk": 10
+        "disk": {
+            "/dev/xvda": {
+                "size": 20,
+                "use_for_backup": False,
+                "dot": True
+            },
+            '/dev/xvdf': {
+                "size": 10,
+                "use_for_backup": True,
+                "dot": False
+            }
+        }
     },
     "Peer": {
         "type": "t2.micro",
         "imageID": "ami-97785bed",
-        "disk": 10
+        "disk": {
+            "/dev/xvda": {
+                "size": 10,
+                "type": "data disk",
+                "dot": True
+            }
+        }
     }
 }
 
@@ -81,11 +97,17 @@ def make_connection(**kwargs):
     ssh_client = paramiko.SSHClient()
     ssh_client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
     if "key_file_path" in kwargs:
-        key_file = paramiko.RSAKey.from_private_key_file(kwargs["key_file_path"])
+        key_file = paramiko.RSAKey.from_private_key_file(kwargs["key_file_path"].replace(".pub", ""))
         ssh_client.connect(hostname=kwargs["host"], username=kwargs["user"], pkey=key_file)
     else:
         ssh_client.connect(hostname=kwargs["host"], username=kwargs["user"], password=kwargs["pass"])
     return ssh_client
+
+
+def execute_to_command(**kwargs):
+    with make_connection(host=kwargs["host"], user="ec2-user", key_file_path=os.getenv("PUB_KEY")) as conn:
+        _, stdout, stderr = conn.exec_command(kwargs["command"])
+        return stdout.readlines(), stderr.readlines()
 
 
 def get_ec2_session(region):
@@ -126,24 +148,16 @@ def create_instance(manager, node_type, customer_id):
     node_prop = NODE_PROP[node_type]
     block_dev = list()
     backup_disk = list()
-    if "disk" in node_prop:
+    device_list = list()
+    for k, v in node_prop["disk"].iteritems():
+        if v["use_for_backup"]:
+            backup_disk.append(k)
         block_dev.append(
             {
-                "DeviceName": "/dev/xvda",
+                "DeviceName": k,
                 "Ebs": {
-                    "VolumeSize": node_prop["disk"],
-                    "DeleteOnTermination": True
-                }
-            }
-        )
-    if "backup_disk" in node_prop:
-        backup_disk.append("/dev/xvdb")
-        block_dev.append(
-            {
-                "DeviceName": "/dev/xvdb",
-                "Ebs": {
-                    "VolumeSize": node_prop["backup_disk"],
-                    "DeleteOnTermination": True
+                    "VolumeSize": v["size"],
+                    "DeleteOnTermination": v["dot"]
                 }
             }
         )
@@ -169,12 +183,11 @@ def create_instance(manager, node_type, customer_id):
             }
         ]
     )
-    device_list = list()
     while not device_list:
         device_list = manager.Instance(instance_id).block_device_mappings
         time.sleep(1)
     for device in device_list:
-        if device["DeviceName"][5:] in backup_disk:
+        if device["DeviceName"] in backup_disk:
             name = "BackupDisk-" + device["DeviceName"][5:]
         else:
             name = "DataDisk-" + device["DeviceName"][5:]
@@ -192,7 +205,11 @@ def create_instance(manager, node_type, customer_id):
             ]
         )
     if len(backup_disk) > 0:
-        pass
+        while instance[0].state["Name"] != "running":
+            time.sleep(1)
+        mount_command = open("build_backup_disk.sh", "r").read()
+        for d in backup_disk:
+            execute_to_command(host=instance[0].private_ip_address, command=mount_command.replace("$1", d))
     return instance_id
 
 
@@ -228,13 +245,11 @@ def execute_operation(argv):
     else:
         filter = [{"Name": "tag:CustomerID", "Values": [argv.customer_id]}]
     for target in ec2_client.describe_instances(Filters=filter)["Reservations"][0]["Instances"]:
-        with make_connection(host=target["PublicIpAddress"], user="ec2-user", key_file_path=os.getenv("PUB_KEY")) as conn:
-            _, stdout, stderr = conn.exec_command(command)
-            err = stderr.readlines()
-            if len(err) > 0:
-                results.append(colored("Error occurred when running script named %s on %s.\nError is: \n\t%s" %(argv.script_path, target["PublicIpAddress"], "\t".join(err)), "red"))
-                continue
-            results.append(colored("Execution successful for %s.\nOutput is: \n\t%s" %(target["PublicIpAddress"], "\t".join(stdout.readlines())), "green"))
+        err, out = execute_to_command(host=target["PublicIpAddress"], command=command)
+        if len(err) > 0:
+            results.append(colored("Error occurred when running script named %s on %s.\nError is: \n\t%s" %(argv.script_path, target["PublicIpAddress"], "\t".join(err)), "red"))
+            continue
+        results.append(colored("Execution successful for %s.\nOutput is: \n\t%s" %(target["PublicIpAddress"], "\t".join(out)), "green"))
     return "\n".join(results)
 
 
